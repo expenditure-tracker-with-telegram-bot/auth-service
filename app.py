@@ -1,137 +1,93 @@
-# auth_service/app.py
 from flask import Flask, request, jsonify
 from pymongo import MongoClient
 import bcrypt
 import jwt
 import os
 from datetime import datetime, timedelta
+from functools import wraps
 
 app = Flask(__name__)
 
-# Configuration
-MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb+srv://RattanakVicboth:Dambo123@rattanakvicboth.7whe9xy.mongodb.net/ProjDB?retryWrites=true&w=majority&appName=RattanakVicboth')
-JWT_SECRET = os.getenv('JWT_SECRET', 'your-secret')
+MONGODB_URI = os.getenv('MONGODB_URI')
+JWT_SECRET = os.getenv('JWT_SECRET')
 PORT = int(os.getenv('PORT', 5001))
 
-# Database connection
 client = MongoClient(MONGODB_URI)
 db = client.get_database()
 users_collection = db.users
+transactions_collection = db.transactions
 
-@app.route('/health')
-def health():
-    return jsonify({'status': 'Auth Service running', 'port': PORT})
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        role = request.headers.get('X-Role')
+        if role != 'Admin':
+            return jsonify({'error': 'Service-level authorization failed'}), 403
+        return f(*args, **kwargs)
+
+    return decorated_function
+
 
 @app.route('/signup', methods=['POST'])
 def signup():
     try:
         data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        role = data.get('role', 'user')  # default role is 'user'
-
-        if not username or not password:
-            return jsonify({'error': 'Username and password required'}), 400
-
-        # Check if user exists
-        if users_collection.find_one({'username': username}):
-            return jsonify({'error': 'User already exists'}), 409
-
-        # Hash password
+        username, password, role = data.get('username'), data.get('password'), data.get('role', 'user')
+        if not username or not password: return jsonify({'error': 'Username and password required'}), 400
+        if users_collection.find_one({'username': username}): return jsonify({'error': 'User already exists'}), 409
         hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-
-        # Create user
-        user_data = {
-            'username': username,
-            'password': hashed_password,
-            'role': role,
-            'created_at': datetime.utcnow()
-        }
-
+        user_data = {'username': username, 'password': hashed_password, 'role': role, 'created_at': datetime.utcnow()}
         result = users_collection.insert_one(user_data)
-
-        return jsonify({
-            'message': 'User created successfully',
-            'user_id': str(result.inserted_id)
-        }), 201
-
+        return jsonify({'message': 'User created', 'user_id': str(result.inserted_id)}), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/login', methods=['POST'])
 def login():
     try:
         data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-
-        if not username or not password:
-            return jsonify({'error': 'Username and password required'}), 400
-
-        # Find user
+        username, password = data.get('username'), data.get('password')
+        if not username or not password: return jsonify({'error': 'Username and password required'}), 400
         user = users_collection.find_one({'username': username})
-        if not user:
+        if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password']):
             return jsonify({'error': 'Invalid credentials'}), 401
-
-        # Check password
-        if not bcrypt.checkpw(password.encode('utf-8'), user['password']):
-            return jsonify({'error': 'Invalid credentials'}), 401
-
-        # Generate JWT
         payload = {
-            'Username': username,
-            'Role': user['role'],
-            'Issuer': 'ExpenseTracker',
-            'exp': datetime.utcnow() + timedelta(days=1),
-            'iat': datetime.utcnow()
+            'Username': username, 'Role': user['role'], 'Issuer': 'ExpenseTracker',
+            'exp': datetime.utcnow() + timedelta(days=1), 'iat': datetime.utcnow()
         }
-
         token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
-
-        # Update last login
-        users_collection.update_one(
-            {'username': username},
-            {'$set': {'last_login': datetime.utcnow()}}
-        )
-
-        return jsonify({
-            'token': token,
-            'user': {
-                'username': username,
-                'role': user['role']
-            }
-        }), 200
-
+        users_collection.update_one({'username': username}, {'$set': {'last_login': datetime.utcnow()}})
+        return jsonify({'token': token, 'user': {'username': username, 'role': user['role']}}), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/refresh', methods=['POST'])
-def refresh_token():
+
+@app.route('/admin/stats/users', methods=['GET'])
+@admin_required
+def get_user_stats():
     try:
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Missing token'}), 401
-
-        token = auth_header.split(' ')[1]
-        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'], options={"verify_exp": False})
-
-        # Generate new token
-        new_payload = {
-            'Username': payload['Username'],
-            'Role': payload['Role'],
-            'Issuer': 'ExpenseTracker',
-            'exp': datetime.utcnow() + timedelta(days=1),
-            'iat': datetime.utcnow()
-        }
-
-        new_token = jwt.encode(new_payload, JWT_SECRET, algorithm='HS256')
-
-        return jsonify({'token': new_token}), 200
-
-    except jwt.InvalidTokenError:
-        return jsonify({'error': 'Invalid token'}), 401
+        total_users = users_collection.count_documents({})
+        last_24h = datetime.utcnow() - timedelta(hours=24)
+        active_users = users_collection.count_documents({'last_login': {'$gte': last_24h}})
+        return jsonify({
+            'total_users': total_users,
+            'active_users_last_24h': active_users
+        }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/admin/stats/transactions', methods=['GET'])
+@admin_required
+def get_transaction_stats():
+    try:
+        total_transactions = transactions_collection.count_documents({})
+        return jsonify({'total_transactions': total_transactions}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT, debug=True)
