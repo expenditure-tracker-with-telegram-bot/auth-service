@@ -9,5 +9,6 @@ uvicorn[standard]
 python-dotenv
 requests
 bcrypt
-redis
+pydantic
 certifi
+redis
