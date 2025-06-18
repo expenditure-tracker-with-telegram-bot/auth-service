@@ -1,236 +1,116 @@
-from flask import Flask, request, jsonify
-import bcrypt
-import jwt
+import uuid
 from datetime import datetime, timedelta
 from functools import wraps
-from config import db, PORT, JWT_SECRET
+import bcrypt
+import jwt
+from flask import Flask, request, jsonify, g
+
+from config import db, redis_client, JWT_SECRET, PORT
 
 app = Flask(__name__)
 
 users_collection = db.users
-transactions_collection = db.transactions
 
-def verify_jwt_token(token):
-    """Verify and decode JWT token"""
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        return payload
-    except jwt.ExpiredSignatureError:
-        return None
-    except jwt.InvalidTokenError:
-        return None
 
-def admin_required(f):
+def get_user_from_headers(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        # Check both JWT token and role header for security
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Missing or invalid authorization header'}), 401
+        g.user = request.headers.get('X-User-Username')
+        g.role = request.headers.get('X-User-Role')
+        g.jti = request.headers.get('X-Token-Jti')
+        g.exp = request.headers.get('X-Token-Exp')
 
-        token = auth_header.split(' ')[1]
-        payload = verify_jwt_token(token)
-
-        if not payload:
-            return jsonify({'error': 'Invalid or expired token'}), 401
-
-        if payload.get('Role') != 'Admin':
-            return jsonify({'error': 'Admin access required'}), 403
-
+        if not g.user or not g.jti:
+            return jsonify({'error': 'Authentication information missing from request'}), 401
         return f(*args, **kwargs)
+
     return decorated_function
 
-def auth_required(f):
-    """General authentication decorator"""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Missing or invalid authorization header'}), 401
-
-        token = auth_header.split(' ')[1]
-        payload = verify_jwt_token(token)
-
-        if not payload:
-            return jsonify({'error': 'Invalid or expired token'}), 401
-
-        # Add user info to request context
-        request.user = payload
-        return f(*args, **kwargs)
-    return decorated_function
 
 @app.route('/signup', methods=['POST'])
 def signup():
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-        role = data.get('role', 'user')
+    data = request.get_json() or {}
+    username = data.get('username')
+    password = data.get('password')
+    role = data.get('role', 'user')
 
-        # Input validation
-        if not username or not password:
-            return jsonify({'error': 'Username and password required'}), 400
+    if not username or not password:
+        return jsonify({'error': 'Username and password required'}), 400
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    if users_collection.find_one({'username': username}):
+        return jsonify({'error': 'User already exists'}), 409
 
-        if len(password) < 6:
-            return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    if role == 'Admin':
+        requesting_role = request.headers.get('X-User-Role')
+        if requesting_role != 'Admin':
+            return jsonify({'error': 'Only an admin can create another admin'}), 403
 
-        if users_collection.find_one({'username': username}):
-            return jsonify({'error': 'User already exists'}), 409
+    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+    user_doc = {
+        'username': username,
+        'password': hashed,
+        'role': role,
+        'created_at': datetime.utcnow(),
+    }
+    res = users_collection.insert_one(user_doc)
+    return jsonify({
+        'message': 'User created successfully',
+        'user_id': str(res.inserted_id)
+    }), 201
 
-        # Only allow admin role creation by existing admins
-        if role == 'Admin':
-            auth_header = request.headers.get('Authorization')
-            if auth_header and auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
-                payload = verify_jwt_token(token)
-                if not payload or payload.get('Role') != 'Admin':
-                    role = 'user'  # Force to user role if not admin
-            else:
-                role = 'user'
-
-        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-        user_data = {
-            'username': username,
-            'password': hashed_password,
-            'role': role,
-            'created_at': datetime.utcnow(),
-            'active': True
-        }
-
-        result = users_collection.insert_one(user_data)
-        return jsonify({
-            'message': 'User created successfully',
-            'user_id': str(result.inserted_id)
-        }), 201
-
-    except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
 
 @app.route('/login', methods=['POST'])
 def login():
+    data = request.get_json() or {}
+    username = data.get('username')
+    password = data.get('password')
+    user = users_collection.find_one({'username': username})
+    if not user or not bcrypt.checkpw(password.encode(), user['password']):
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+    exp_time = datetime.utcnow() + timedelta(days=1)
+    payload = {
+        'username': user['username'],
+        'role': user['role'],
+        'exp': exp_time,
+        'iat': datetime.utcnow(),
+        'jti': str(uuid.uuid4())
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+    return jsonify({'token': token}), 200
+
+
+@app.route('/logout', methods=['POST'])
+@get_user_from_headers
+def logout():
     try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
+        token_exp_timestamp = int(g.exp)
+        now_timestamp = int(datetime.utcnow().timestamp())
+        ttl = max(0, token_exp_timestamp - now_timestamp)
 
-        if not username or not password:
-            return jsonify({'error': 'Username and password required'}), 400
+        if ttl > 0:
+            redis_key = f"blacklist:{g.jti}"
+            redis_client.setex(redis_key, ttl, "true")
 
-        user = users_collection.find_one({'username': username, 'active': True})
-
-        if not user or not bcrypt.checkpw(password.encode('utf-8'), user['password']):
-            return jsonify({'error': 'Invalid credentials'}), 401
-
-        # Create JWT payload
-        payload = {
-            'Username': username,
-            'Role': user['role'],
-            'Issuer': 'ExpenseTracker',
-            'exp': datetime.utcnow() + timedelta(days=1),
-            'iat': datetime.utcnow()
-        }
-
-        token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
-
-        # Update last login
-        users_collection.update_one(
-            {'username': username},
-            {'$set': {'last_login': datetime.utcnow()}}
-        )
-
-        return jsonify({
-            'token': token,
-            'user': {
-                'username': username,
-                'role': user['role']
-            }
-        }), 200
-
+        return jsonify({'message': 'Successfully logged out'}), 200
     except Exception as e:
-        return jsonify({'error': f'Server error: {str(e)}'}), 500
+        return jsonify({'error': 'Logout failed', 'details': str(e)}), 500
 
-@app.route('/verify', methods=['POST'])
-def verify_token():
-    """Endpoint to verify token validity"""
-    try:
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'valid': False, 'error': 'Missing authorization header'}), 401
-
-        token = auth_header.split(' ')[1]
-        payload = verify_jwt_token(token)
-
-        if not payload:
-            return jsonify({'valid': False, 'error': 'Invalid or expired token'}), 401
-
-        return jsonify({
-            'valid': True,
-            'user': {
-                'username': payload.get('Username'),
-                'role': payload.get('Role')
-            }
-        }), 200
-
-    except Exception as e:
-        return jsonify({'valid': False, 'error': str(e)}), 500
-
-@app.route('/admin/stats/users', methods=['GET'])
-@admin_required
-def get_user_stats():
-    try:
-        total_users = users_collection.count_documents({'active': True})
-        last_24h = datetime.utcnow() - timedelta(hours=24)
-        active_users = users_collection.count_documents({
-            'last_login': {'$gte': last_24h},
-            'active': True
-        })
-
-        return jsonify({
-            'total_users': total_users,
-            'active_users_last_24h': active_users
-        }), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/admin/stats/transactions', methods=['GET'])
-@admin_required
-def get_transaction_stats():
-    try:
-        total_transactions = transactions_collection.count_documents({})
-        last_24h = datetime.utcnow() - timedelta(hours=24)
-        recent_transactions = transactions_collection.count_documents({
-            'timestamp': {'$gte': last_24h}
-        })
-
-        return jsonify({
-            'total_transactions': total_transactions,
-            'recent_transactions_24h': recent_transactions
-        }), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/admin/users', methods=['GET'])
-@admin_required
+@get_user_from_headers
 def list_users():
-    try:
-        users = list(users_collection.find(
-            {'active': True},
-            {'password': 0}  # Exclude password field
-        ))
+    if g.role != 'Admin':
+        return jsonify({'error': 'Admin access required'}), 403
 
-        for user in users:
-            user['_id'] = str(user['_id'])
-            if 'created_at' in user:
-                user['created_at'] = user['created_at'].isoformat()
-            if 'last_login' in user:
-                user['last_login'] = user['last_login'].isoformat()
+    users = list(users_collection.find({}, {'password': 0}))
+    for u in users:
+        u['_id'] = str(u['_id'])
+        if 'created_at' in u:
+            u['created_at'] = u['created_at'].isoformat()
+    return jsonify({'users': users}), 200
 
-        return jsonify({'users': users}), 200
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT, debug=True)
+    app.run(host='0.0.0.0', port=PORT)
