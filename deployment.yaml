@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-service-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: auth-service
+  template:
+    metadata:
+      labels:
+        app: auth-service
+    spec:
+      containers:
+      - name: auth-service
+        image: pr0meth4us/auth-service:latest
+        ports:
+        - containerPort: 5002
+        env:
+        - name: PORT
+          value: "5002"
+        - name: REDIS_HOST
+          value: "redis-15904.crce185.ap-seast-1-1.ec2.redns.redis-cloud.com"
+        - name: REDIS_PORT
+          value: "15904"
+        - name: MONGODB_URI
+          valueFrom:
+            secretKeyRef:
+              name: my-secrets
+              key: mongodb_uri
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: my-secrets
+              key: jwt_secret
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: my-secrets
+              key: redis_password
